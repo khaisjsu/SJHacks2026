@@ -178,24 +178,115 @@ def extract_watermark(input_path, watermark_length):
 
 
 # -----------------------------
+# Self-describing payloads (used by the API)
+# -----------------------------
+#
+# The functions above need the caller to know the watermark length ahead of
+# time, which makes it impossible to verify an unknown image. The functions
+# below write a small header first:
+#
+#     b"PG" (magic) + 1 byte payload length + UTF-8 payload bytes
+#
+# so `extract_payload` can tell whether an image carries a PhotoGuard mark at
+# all, and read it back without any extra information. UTF-8 also fixes
+# characters outside Latin-1 (emoji, accents), which `text_to_bits` mangles.
+
+MAGIC = b"PG"
+MAX_PAYLOAD_BYTES = 255
+_C1 = (3, 4)
+_C2 = (4, 3)
+_STRENGTH = 30
+
+
+def _bytes_to_bits(data: bytes):
+    return [(byte >> (7 - i)) & 1 for byte in data for i in range(8)]
+
+
+def _bits_to_bytes(bits) -> bytes:
+    out = bytearray()
+    for i in range(0, len(bits) - 7, 8):
+        value = 0
+        for bit in bits[i:i + 8]:
+            value = (value << 1) | bit
+        out.append(value)
+    return bytes(out)
+
+
+def _block_positions(height, width):
+    for row in range(0, height - 8, 8):
+        for col in range(0, width - 8, 8):
+            yield row, col
+
+
+def capacity_bytes(img) -> int:
+    """How many payload bytes an image can hold (after the 3-byte header)."""
+    h, w = img.shape[:2]
+    blocks = len(range(0, h - 8, 8)) * len(range(0, w - 8, 8))
+    return max(0, blocks // 8 - len(MAGIC) - 1)
+
+
+def embed_payload(img, payload: str):
+    """Return a copy of a BGR image with `payload` hidden in its DCT coefficients."""
+    data = payload.encode("utf-8")
+    if len(data) > MAX_PAYLOAD_BYTES:
+        raise ValueError("Watermark text is too long.")
+    if len(data) > capacity_bytes(img):
+        raise ValueError("Image is too small to store this watermark.")
+
+    bits = _bytes_to_bits(MAGIC + bytes([len(data)]) + data)
+    ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+    y_channel = ycrcb[:, :, 0].astype(np.float32)
+
+    for bit, (row, col) in zip(bits, _block_positions(*y_channel.shape)):
+        block = dct2(y_channel[row:row + 8, col:col + 8])
+        c1, c2 = block[_C1], block[_C2]
+        hi, lo = max(c1, c2) + _STRENGTH, min(c1, c2)
+        block[_C1], block[_C2] = (hi, lo) if bit else (lo, hi)
+        y_channel[row:row + 8, col:col + 8] = idct2(block)
+
+    ycrcb[:, :, 0] = np.clip(y_channel, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+
+
+def extract_payload(img):
+    """Return the hidden payload string, or None if the image has no PhotoGuard mark."""
+    ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+    y_channel = ycrcb[:, :, 0].astype(np.float32)
+    positions = _block_positions(*y_channel.shape)
+
+    def read_bytes(count):
+        bits = []
+        for row, col in positions:
+            block = dct2(y_channel[row:row + 8, col:col + 8])
+            bits.append(1 if block[_C1] > block[_C2] else 0)
+            if len(bits) == count * 8:
+                break
+        return _bits_to_bytes(bits) if len(bits) == count * 8 else None
+
+    header = read_bytes(len(MAGIC) + 1)
+    if not header or header[:len(MAGIC)] != MAGIC:
+        return None
+    body = read_bytes(header[-1])
+    if body is None:
+        return None
+    try:
+        return body.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+# -----------------------------
 # Example usage
 # -----------------------------
 
 if __name__ == "__main__":
-    original_image = "original.JPG"
-    watermarked_image = "notWatermarked.JPG"
+    import sys
 
-    watermark = "wm8KD29Aimg4560425a9f3"
+    if len(sys.argv) != 2:
+        print("Usage: python DCT.py <image>  — prints the hidden PhotoGuard mark, if any")
+        sys.exit(1)
 
-    # embed_watermark(
-    #     input_path=original_image,
-    #     output_path=watermarked_image,
-    #     watermark_text=watermark
-    # )
-
-    extracted = extract_watermark(
-        input_path=watermarked_image,
-        watermark_length=len(watermark)
-    )
-
-    print("Extracted watermark:", extracted)
+    image = cv2.imread(sys.argv[1])
+    if image is None:
+        sys.exit("Could not read that image.")
+    print("Hidden mark:", extract_payload(image))

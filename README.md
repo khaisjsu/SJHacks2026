@@ -1,316 +1,112 @@
+# PhotoGuard 🛡️
 
-# PhotoGuard Frontend
+Protect your photos before you share them. Built at **SJ Hacks 2026**.
 
-This is the frontend for the PhotoGuard demo.
+When you upload a photo, PhotoGuard:
 
-## Running The App
+1. **Strips private metadata** — GPS location, camera model, serial number and capture date are removed (phone photos often carry your exact location).
+2. **Hides an ownership mark inside the image** using the Discrete Cosine Transform (DCT). The photo looks unchanged, but the mark survives re-saving and JPEG compression.
+3. **Fingerprints the file** with SHA-256 as proof of when you registered it.
 
-Run this once to install packages:
+You can then add a visible watermark, share the photo through a link you can revoke at any time, and **verify** any copy you find online to see whether it carries your mark.
+
+## Run it locally
+
+You need **Python 3.10+** and **Node.js 18+**.
+
+### Quick start (macOS / Linux)
 
 ```bash
-npm i
+./start.sh
 ```
 
-Run this to start the frontend:
+Then open **http://localhost:5173**, create an account, and upload a photo.
+
+### Manual start (two terminals, works on Windows too)
+
+**Terminal 1 — backend (port 3000)**
 
 ```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn api:app --port 3000 --reload
+```
+
+**Terminal 2 — frontend (port 5173)**
+
+```bash
+cd frontend
+npm install
 npm run dev
 ```
 
-## Backend Connection
+Interactive API docs are at http://localhost:3000/docs.
 
-The frontend is ready for these backend endpoints:
+All data (accounts, images, database) lives in `backend/data/`. Delete that folder to start fresh.
 
-```txt
-POST /auth/signup
-POST /auth/login
-POST /upload
-POST /watermark
-GET /image/:id/download
-```
+## Try the verify feature
 
-The backend connection code is in:
+1. Upload a photo and download it from the vault.
+2. Re-save it as a JPEG, or crop it lightly in any editor.
+3. Open **Verify Ownership** and drop the copy in. PhotoGuard reads the hidden mark and tells you who registered it and when — even though the file's hash no longer matches.
 
-[src/services/api.ts](src/services/api.ts)
-
-Search for `BACKEND` in the code to find the important integration points.
-
-## Backend URL
-
-By default, the frontend tries to talk to:
-
-```txt
-http://localhost:3000
-```
-
-When you build your backend, create a `.env` file in this project root:
+You can also check an image from the command line:
 
 ```bash
-VITE_API_BASE_URL=http://localhost:3000
+cd backend && python DCT.py path/to/image.jpg
 ```
 
-If your backend runs on another port, change the number:
+## How it works
+
+```
+frontend/  React + TypeScript + Tailwind (Vite dev server, proxies API calls)
+backend/
+  api.py     FastAPI app: auth, vault, watermarking, sharing, verification
+  DCT.py     invisible watermark: embed/extract bits in 8×8 DCT blocks
+  tests/     pytest suite (functional + security tests)
+  data/      created on first run: SQLite DB, images, server secret
+```
+
+### Invisible watermark
+
+Each image is converted to YCrCb and the brightness channel is split into 8×8 blocks. For each block, two mid-frequency DCT coefficients are compared: making one larger than the other encodes a 1 or a 0. Mid frequencies are a good trade-off — changes there are hard to see, but survive JPEG compression, which mostly discards high frequencies.
+
+The hidden message starts with a short header (`PG` + length), so the verifier can tell whether an image is marked at all and read it without knowing the length in advance. The payload also includes part of the image ID, which links a modified copy back to the original record.
+
+### Security
+
+| Area | What PhotoGuard does |
+|---|---|
+| Passwords | Hashed with salted **scrypt**; never stored or sent back in plain text. Constant-time comparison. |
+| Brute force | 5 failed sign-ins locks that username for 5 minutes. |
+| Sessions | Random 256-bit bearer tokens, stored only as SHA-256 hashes, expire after 7 days, invalidated on logout. |
+| Access control | Every vault request checks the token and the image owner. Other users' images return 404, the same as missing ones. |
+| File access | Images are not public. The browser loads them through HMAC-signed URLs. |
+| Sharing | Each share is a separate random link; **revoke deletes it** so it stops working immediately. |
+| Uploads | 15 MB / 40 MP limits, must decode as a real JPEG, PNG or WebP, then re-encoded server-side (drops EXIF and anything hidden in the file). |
+| Paths | File names are server-generated UUIDs, validated on every request — no path traversal. |
+| Headers | CORS limited to the frontend origin; `nosniff` and `no-referrer` on every response. |
+
+## Tests
 
 ```bash
-VITE_API_BASE_URL=http://localhost:8000
+cd backend
+pip install -r requirements-dev.txt
+pytest
 ```
 
-After changing `.env`, restart the frontend dev server.
+The suite covers the full flow plus attack cases: wrong passwords, lockout, stolen or missing tokens, one user accessing another's files, path traversal, forged file links, HTML uploaded as an "image", revoked share links, and verifying a recompressed copy.
 
-## Where The Endpoints Are Used
+## Limitations / next steps
 
-### 1. Sign Up
+- The invisible mark survives JPEG compression and re-saving, but not heavy cropping, rotation or resizing. A sync pattern or spread-spectrum embedding would make it more robust.
+- The SHA-256 proof is only as trustworthy as this server. Anchoring the hash to an external timestamping service (RFC 3161) would make it independently verifiable.
+- Built for local use: for a real deployment, serve over HTTPS and move storage to a managed database and object store.
 
-Frontend callback:
+## Team
 
-[src/app/App.tsx](src/app/App.tsx)
+Built at SJ Hacks 2026 by Khai Nguyen, Gavin and Duc.
 
-Search:
-
-```txt
-BACKEND INTEGRATION: Sign-up starts here.
-```
-
-API function:
-
-```ts
-signUpUser({ fullName, username, password })
-```
-
-Backend route:
-
-```txt
-POST /auth/signup
-```
-
-The frontend sends:
-
-```json
-{
-  "fullName": "Gavin",
-  "username": "gavin",
-  "password": "password123"
-}
-```
-
-Good backend response:
-
-```json
-{
-  "user": {
-    "id": "user-123",
-    "fullName": "Gavin",
-    "username": "gavin"
-  }
-}
-```
-
-Your AWS backend should save this user in your database. Do not store raw passwords in the database. Hash them on the backend.
-
-### 2. Login
-
-Frontend callback:
-
-[src/app/App.tsx](src/app/App.tsx)
-
-Search:
-
-```txt
-BACKEND INTEGRATION: Login starts here.
-```
-
-API function:
-
-```ts
-loginUser({ username, password })
-```
-
-Backend route:
-
-```txt
-POST /auth/login
-```
-
-The frontend sends:
-
-```json
-{
-  "username": "gavin",
-  "password": "password123"
-}
-```
-
-Good backend response:
-
-```json
-{
-  "token": "jwt-or-session-token",
-  "user": {
-    "id": "user-123",
-    "fullName": "Gavin",
-    "username": "gavin"
-  }
-}
-```
-
-### 3. Upload Image
-
-Frontend callback:
-
-[src/app/App.tsx](src/app/App.tsx)
-
-Search:
-
-```txt
-BACKEND INTEGRATION: Upload starts here.
-```
-
-API function:
-
-```ts
-uploadImage(file, ownerName)
-```
-
-Backend route:
-
-```txt
-POST /upload
-```
-
-The frontend sends:
-
-```ts
-FormData {
-  file: File,
-  owner: string
-}
-```
-
-Good backend response:
-
-```json
-{
-  "id": "image-123",
-  "url": "https://your-backend.com/files/image-123.png",
-  "name": "photo.png",
-  "size": "2.4 MB",
-  "uploadedAt": "2026-04-25T12:00:00Z",
-  "owner": "gavin"
-}
-```
-
-### 4. Apply Watermark
-
-Frontend callback:
-
-[src/app/App.tsx](src/app/App.tsx)
-
-Search:
-
-```txt
-BACKEND INTEGRATION: Watermarking starts here.
-```
-
-API function:
-
-```ts
-watermarkImage(id, settings)
-```
-
-Backend route:
-
-```txt
-POST /watermark
-```
-
-The frontend sends:
-
-```json
-{
-  "imageId": "image-123",
-  "settings": {
-    "type": "visible",
-    "text": "© Gavin",
-    "position": "center",
-    "opacity": 50,
-    "size": 40
-  }
-}
-```
-
-Good backend response:
-
-```json
-{
-  "watermarkedUrl": "https://your-backend.com/files/image-123-watermarked.png"
-}
-```
-
-### 5. Download Image
-
-Frontend callback:
-
-[src/app/App.tsx](src/app/App.tsx)
-
-Search:
-
-```txt
-BACKEND INTEGRATION: Download starts here.
-```
-
-API function:
-
-```ts
-downloadImage(id)
-```
-
-Backend route:
-
-```txt
-GET /image/:id/download
-```
-
-The backend should return the actual image file, not JSON.
-
-## Changing Endpoint Names
-
-If your backend uses different route names, update this file:
-
-[src/services/api.ts](src/services/api.ts)
-
-Look for:
-
-```ts
-const API_ENDPOINTS = {
-  signup: '/auth/signup',
-  login: '/auth/login',
-  upload: '/upload',
-  watermark: '/watermark',
-  download: (imageId: string) => `/image/${encodeURIComponent(imageId)}/download`,
-};
-```
-
-For example, if your backend uses `/api/upload`, change:
-
-```ts
-upload: '/upload',
-```
-
-to:
-
-```ts
-upload: '/api/upload',
-```
-
-## Demo Fallbacks
-
-The app still works without a backend right now.
-
-If the backend is not running:
-
-- Uploads stay in browser memory.
-- Visible watermarking happens in the browser.
-- Downloads use the browser's local image URL.
-- Sign-up and login use one local browser account.
-
-That fallback code is only there so the demo does not break while the backend is still unfinished.
+UI components from [shadcn/ui](https://ui.shadcn.com/) (MIT) — see `ATTRIBUTIONS.md`.

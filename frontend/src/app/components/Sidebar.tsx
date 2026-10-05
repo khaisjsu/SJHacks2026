@@ -3,6 +3,7 @@ import {
   Upload,
   FolderLock,
   Settings,
+  ScanSearch,
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -19,6 +20,7 @@ export function Sidebar({
   const menuItems = [
     { id: 'upload', label: 'Upload / Protect', icon: Upload },
     { id: 'vault', label: 'My Files / Vault', icon: FolderLock, count: photoCount },
+    { id: 'verify', label: 'Verify Ownership', icon: ScanSearch },
     { id: 'settings', label: 'Settings', icon: Settings },
   ];
 
