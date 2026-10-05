@@ -43,6 +43,10 @@ export default defineConfig({
       '/watermark': 'http://localhost:3000',
       '/images': 'http://localhost:3000',
       '/image': 'http://localhost:3000',
+      '/files': 'http://localhost:3000',
+      '/verify': 'http://localhost:3000',
+      // Regex so it doesn't also catch Vite's own /src/... files.
+      '^/s/': 'http://localhost:3000',
     },
   },
 })

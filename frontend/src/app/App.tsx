@@ -13,10 +13,15 @@ import { UploadProgress, UploadingFile } from './components/UploadProgress';
 import { SecurityStatusCard } from './components/SecurityStatusCard';
 import { WatermarkCustomizer, WatermarkSettings } from './components/WatermarkCustomizer';
 import { SecurityRiskPreview, RiskAnalysis } from './components/SecurityRiskPreview';
+import { VerifyPanel } from './components/VerifyPanel';
 import {
+  AUTH_TOKEN_STORAGE_KEY,
+  UNAUTHORIZED_EVENT,
   ApiError,
+  RemoteImage,
   downloadImage,
   loginUser,
+  logoutUser,
   signUpUser,
   uploadImage,
   watermarkImage,
@@ -25,8 +30,6 @@ import {
   shareImage,
   revokeImage,
 } from '../services/api';
-import { hashFile } from '../utils/crypto';
-import { embedInvisibleWatermark } from '../utils/watermark';
 
 interface Photo {
   id: string;
@@ -50,12 +53,13 @@ interface EnhancedPhoto extends Photo {
   watermarkSize?: number;
   protectionStatus?: string[];
   hashFingerprint?: string;
+  metadataRemoved?: string[];
 }
 
+// Only the display name is remembered in the browser — never the password.
 interface StoredAccount {
   fullName: string;
   username: string;
-  password: string;
 }
 
 interface ActivityRecord {
@@ -74,14 +78,17 @@ type AuthScreen = 'welcome' | 'signup' | 'signin' | 'dashboard';
 
 const ACCOUNT_STORAGE_KEY = 'photoguard-account';
 const SESSION_STORAGE_KEY = 'photoguard-session';
-const AUTH_TOKEN_STORAGE_KEY = 'photoguard-auth-token';
 
 function readStoredAccount(): StoredAccount | null {
   if (typeof window === 'undefined') return null;
   const raw = window.localStorage.getItem(ACCOUNT_STORAGE_KEY);
   if (!raw) return null;
   try {
-    return JSON.parse(raw) as StoredAccount;
+    // Older versions saved the password here; rewrite without it.
+    const { fullName, username } = JSON.parse(raw) as StoredAccount;
+    const account = { fullName, username };
+    window.localStorage.setItem(ACCOUNT_STORAGE_KEY, JSON.stringify(account));
+    return account;
   } catch {
     return null;
   }
@@ -89,7 +96,41 @@ function readStoredAccount(): StoredAccount | null {
 
 function readStoredSession(): string | null {
   if (typeof window === 'undefined') return null;
+  // A session only counts if the server gave us a token for it.
+  if (!window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY)) return null;
   return window.localStorage.getItem(SESSION_STORAGE_KEY);
+}
+
+function toPhoto(img: RemoteImage): EnhancedPhoto {
+  const status = ['Invisible watermark', 'Metadata stripped', 'Fingerprinted'];
+  if (!img.invisibleWatermark) status.shift();
+  if (img.visibleWatermark) status.push('Visible watermark');
+  if (img.shared) status.push('Shared');
+  return {
+    id: img.id,
+    name: img.name,
+    url: img.url,
+    watermarked: img.watermarked,
+    size: img.size,
+    uploadedAt: new Date(img.uploadedAt),
+    owner: img.owner,
+    shared: img.shared,
+    shareUrl: img.shareUrl ?? undefined,
+    viewCount: 0,
+    visibleWatermarkEnabled: Boolean(img.visibleWatermark),
+    invisibleWatermarkEnabled: Boolean(img.invisibleWatermark),
+    watermarkText: img.visibleWatermark ?? img.invisibleWatermark ?? undefined,
+    watermarkPosition: 'center',
+    watermarkOpacity: 50,
+    watermarkSize: 40,
+    protectionStatus: status,
+    hashFingerprint: img.hashFingerprint,
+    metadataRemoved: img.metadataRemoved,
+  };
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : 'Something went wrong.';
 }
 
 function getInitialScreen(): AuthScreen {
@@ -98,66 +139,6 @@ function getInitialScreen(): AuthScreen {
   const account = readStoredAccount();
   if (account) return 'signin';
   return 'welcome';
-}
-
-function createLocalWatermarkedUrl(photoUrl: string, settings: WatermarkSettings) {
-  return new Promise<string>((resolve, reject) => {
-    const img = new Image();
-    img.src = photoUrl;
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        reject(new Error('Unable to prepare image canvas.'));
-        return;
-      }
-
-      canvas.width = img.width;
-      canvas.height = img.height;
-      ctx.drawImage(img, 0, 0);
-
-      const text = settings.text || '© PROTECTED';
-      const fontSize = settings.size;
-      ctx.font = `${fontSize}px ${settings.fontFamily}`;
-      ctx.fillStyle = `rgba(255, 255, 255, ${settings.opacity / 100})`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-
-      if (settings.type === 'visible' && settings.position === 'tiled') {
-        for (let y = fontSize; y < img.height; y += fontSize * 3) {
-          for (let x = fontSize; x < img.width; x += fontSize * 4) {
-            ctx.save();
-            ctx.translate(x, y);
-            ctx.rotate(-Math.PI / 6);
-            ctx.fillText(text, 0, 0);
-            ctx.restore();
-          }
-        }
-      } else if (settings.type === 'visible' && settings.position === 'corner') {
-        ctx.save();
-        ctx.translate(img.width - fontSize, fontSize);
-        ctx.fillText(text, 0, 0);
-        ctx.restore();
-      } else if (settings.type === 'visible' && settings.position === 'custom') {
-        const x = (img.width * (settings.customX || 50)) / 100;
-        const y = (img.height * (settings.customY || 50)) / 100;
-        ctx.save();
-        ctx.translate(x, y);
-        ctx.rotate(-Math.PI / 6);
-        ctx.fillText(text, 0, 0);
-        ctx.restore();
-      } else if (settings.type === 'visible') {
-        ctx.save();
-        ctx.translate(img.width / 2, img.height / 2);
-        ctx.rotate(-Math.PI / 6);
-        ctx.fillText(text, 0, 0);
-        ctx.restore();
-      }
-
-      resolve(canvas.toDataURL('image/png'));
-    };
-    img.onerror = () => reject(new Error('Unable to load image for watermarking.'));
-  });
 }
 
 export default function App() {
@@ -187,15 +168,6 @@ export default function App() {
     password: '',
   });
 
-  // Restore vault when the app opens with an already-active session (page refresh case).
-  useEffect(() => {
-    const session = readStoredSession();
-    if (session) {
-      loadVaultFromBackend(session);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // intentionally runs once on mount only
-
   const addActivity = useCallback((action: string, details: string, severity: ActivityRecord['severity'] = 'info') => {
     const timestamp = new Date();
     setActivityLog(prev => [
@@ -210,43 +182,88 @@ export default function App() {
     ]);
   }, []);
 
-  // Load the user's existing vault from the backend after login.
-  const loadVaultFromBackend = useCallback(async (username: string) => {
+  const clearSession = useCallback(() => {
+    window.localStorage.removeItem(SESSION_STORAGE_KEY);
+    window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    setCurrentUsername(null);
+  }, []);
+
+  // Load the signed-in user's vault from the backend.
+  const loadVaultFromBackend = useCallback(async () => {
     setVaultLoading(true);
     try {
-      const remoteImages = await listImages(username);
+      const remoteImages = await listImages();
+      setPhotos(remoteImages.map(toPhoto));
       if (remoteImages.length > 0) {
-        const loaded: EnhancedPhoto[] = remoteImages.map(img => ({
-          id: img.id ?? img.imageId ?? Math.random().toString(36).slice(2),
-          name: img.name ?? img.filename ?? 'Untitled',
-          url: img.url ?? img.imageUrl ?? img.fileUrl ?? '',
-          watermarked: img.watermarked ?? false,
-          size: img.size ?? '—',
-          uploadedAt: img.uploadedAt ? new Date(img.uploadedAt) : new Date(),
-          owner: img.owner ?? username,
-          shared: img.shared ?? false,
-          shareUrl: img.shareUrl,
-          viewCount: 0,
-          visibleWatermarkEnabled: false,
-          invisibleWatermarkEnabled: true,
-          watermarkText: `© ${username}`,
-          watermarkPosition: 'center',
-          watermarkOpacity: 50,
-          watermarkSize: 40,
-          protectionStatus: img.watermarked ? ['Watermarked'] : ['Preview Ready'],
-          hashFingerprint: img.hashFingerprint,
-        }));
-        setPhotos(loaded);
-        addActivity('Vault loaded', `${loaded.length} file(s) restored from the backend.`);
+        addActivity('Vault loaded', `${remoteImages.length} file(s) restored from the server.`);
       }
-    } catch {
-      addActivity('Vault load skipped', 'Could not reach backend — starting with an empty vault.', 'warning');
+    } catch (error) {
+      addActivity('Vault load failed', errorMessage(error), 'critical');
     } finally {
       setVaultLoading(false);
     }
   }, [addActivity]);
 
-  // Upload: invisible watermark → SHA-256 proof-of-creation → POST /upload
+  // Restore the vault when the app opens with an active session (page refresh),
+  // and send the user back to sign-in if the server rejects their token.
+  useEffect(() => {
+    if (readStoredSession()) loadVaultFromBackend();
+
+    const onUnauthorized = (event: Event) => {
+      clearSession();
+      setPhotos([]);
+      setAuthError((event as CustomEvent<string>).detail || 'Please sign in again.');
+      setAuthScreen('signin');
+    };
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // intentionally runs once on mount only
+
+  const analyzeRisk = (photo: EnhancedPhoto): RiskAnalysis => {
+    const issues: string[] = [];
+    let score = 100;
+
+    if (photo.metadataRemoved && photo.metadataRemoved.length > 0) {
+      issues.push(`The original file exposed: ${photo.metadataRemoved.join(', ')}. PhotoGuard removed it.`);
+      score -= photo.metadataRemoved.includes('GPS location') ? 20 : 10;
+    }
+    if (!photo.invisibleWatermarkEnabled) {
+      issues.push('Image is too small to carry an invisible ownership mark');
+      score -= 20;
+    }
+    if (!photo.watermarked) {
+      issues.push('No visible watermark — copies won\'t show who owns the photo');
+      score -= 25;
+    }
+    if (photo.shared) {
+      issues.push('A public share link is active');
+      score -= 15;
+    }
+
+    const level: 'low' | 'medium' | 'high' =
+      score >= 70 ? 'low' : score >= 40 ? 'medium' : 'high';
+
+    const recommendations: RiskAnalysis['recommendations'] = [];
+
+    if (!photo.watermarked) {
+      recommendations.push({
+        icon: Shield,
+        title: 'Add Visible Watermark',
+        description: 'Stamp your name on the photo so anyone who sees a copy knows it is yours.',
+        action: () => {
+          setRiskAnalysis(null);
+          setShowWatermarkCustomizer(photo.id);
+        },
+        actionLabel: 'Add Watermark',
+      });
+    }
+
+    return { level, score, issues, recommendations };
+  };
+
+  // Upload: the server strips metadata, embeds the invisible DCT watermark
+  // and records a SHA-256 fingerprint.
   const handleFilesAdded = useCallback((files: File[]) => {
     const uploading: UploadingFile[] = files.map(file => ({
       id: Math.random().toString(36).substr(2, 9),
@@ -265,174 +282,50 @@ export default function App() {
         );
       }, 200);
 
-      const ownerName = currentUsername ?? account?.fullName ?? account?.username ?? 'PhotoGuard';
-
-      // Step 1: embed invisible ownership watermark
-      const watermarkedFile = await embedInvisibleWatermark(file, ownerName);
-
-      // Step 2: SHA-256 fingerprint for proof of creation
-      const fingerprint = await hashFile(watermarkedFile);
-      addActivity(
-        'Proof of creation',
-        `${file.name} — SHA-256: ${fingerprint.slice(0, 16)}…`,
-        'info'
-      );
-
       try {
-        // Step 3: POST /upload
-        const uploadedImage = await uploadImage(watermarkedFile, ownerName);
-
-        clearInterval(interval);
-        setUploadingFiles(prev => prev.map(u => u.id === upload.id ? { ...u, progress: 100 } : u));
-        setUploadingFiles(prev => prev.filter(u => u.id !== upload.id));
-
-        const newPhoto: EnhancedPhoto = {
-          id: uploadedImage.id ?? uploadedImage.imageId ?? upload.id,
-          name: uploadedImage.name ?? uploadedImage.filename ?? file.name,
-          url: uploadedImage.url ?? uploadedImage.imageUrl ?? uploadedImage.fileUrl ?? URL.createObjectURL(watermarkedFile),
-          watermarked: false,
-          size: uploadedImage.size ?? upload.size,
-          uploadedAt: uploadedImage.uploadedAt ? new Date(uploadedImage.uploadedAt) : new Date(),
-          owner: uploadedImage.owner ?? ownerName,
-          shared: false,
-          viewCount: 0,
-          visibleWatermarkEnabled: false,
-          invisibleWatermarkEnabled: true,
-          watermarkText: `© ${ownerName}`,
-          watermarkPosition: 'center',
-          watermarkOpacity: 50,
-          watermarkSize: 40,
-          protectionStatus: ['Invisible Watermark Applied', 'Uploaded'],
-          hashFingerprint: fingerprint,
-        };
-
+        const newPhoto = toPhoto(await uploadImage(file));
         setPhotos(prev => [...prev, newPhoto]);
         setActiveView('upload');
-        addActivity('File uploaded', `${file.name} stored on the backend with an invisible watermark.`);
+
+        addActivity('File uploaded', `${file.name} stored with an invisible ownership watermark.`);
+        addActivity('Proof of creation', `${file.name} — SHA-256: ${newPhoto.hashFingerprint?.slice(0, 16)}…`);
+        if (newPhoto.metadataRemoved?.length) {
+          addActivity(
+            'Metadata removed',
+            `${file.name} contained ${newPhoto.metadataRemoved.join(', ')} — stripped before storage.`,
+            'warning'
+          );
+        }
 
         const analysis = analyzeRisk(newPhoto);
         if (analysis.level !== 'low') setRiskAnalysis({ analysis, fileName: newPhoto.name });
-      } catch {
-        // Demo fallback: keep the watermarked image in browser memory
+      } catch (error) {
+        addActivity('Upload failed', `${file.name}: ${errorMessage(error)}`, 'critical');
+      } finally {
         clearInterval(interval);
         setUploadingFiles(prev => prev.filter(u => u.id !== upload.id));
-
-        const newPhoto: EnhancedPhoto = {
-          id: upload.id,
-          name: file.name,
-          url: URL.createObjectURL(watermarkedFile),
-          watermarked: false,
-          size: upload.size,
-          uploadedAt: new Date(),
-          owner: ownerName,
-          shared: false,
-          viewCount: 0,
-          visibleWatermarkEnabled: false,
-          invisibleWatermarkEnabled: true,
-          watermarkText: `© ${ownerName}`,
-          watermarkPosition: 'center',
-          watermarkOpacity: 50,
-          watermarkSize: 40,
-          protectionStatus: ['Invisible Watermark Applied', 'Local Only'],
-          hashFingerprint: fingerprint,
-        };
-
-        setPhotos(prev => [...prev, newPhoto]);
-        setActiveView('upload');
-        addActivity(
-          'Local upload fallback',
-          `${file.name} stayed in the browser (invisible watermark + hash still applied).`,
-          'warning'
-        );
-
-        const analysis = analyzeRisk(newPhoto);
-        if (analysis.level !== 'low') setRiskAnalysis({ analysis, fileName: newPhoto.name });
       }
     });
-  }, [account, addActivity, currentUsername]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [addActivity]);
 
-  const analyzeRisk = (photo: EnhancedPhoto): RiskAnalysis => {
-    const issues: string[] = [];
-    let score = 100;
-
-    if (!photo.watermarked) {
-      issues.push('No visible watermark protection applied');
-      score -= 25;
-    }
-    if (photo.shared) {
-      issues.push('Public sharing is enabled');
-      score -= 15;
-    }
-
-    const level: 'low' | 'medium' | 'high' =
-      score >= 70 ? 'low' : score >= 40 ? 'medium' : 'high';
-
-    const recommendations: RiskAnalysis['recommendations'] = [];
-
-    if (!photo.watermarked) {
-      recommendations.push({
-        icon: Shield,
-        title: 'Add Visible Watermark',
-        description: 'Apply a visible watermark via the backend for maximum protection.',
-        action: () => {
-          setRiskAnalysis(null);
-          setShowWatermarkCustomizer(photo.id);
-        },
-        actionLabel: 'Add Watermark',
-      });
-    }
-
-    return { level, score, issues, recommendations };
-  };
-
-  // Watermark: POST /watermark → update photo state
+  // Watermark: POST /watermark updates the same image in place.
   const applyWatermark = useCallback(async (id: string, wSettings: WatermarkSettings) => {
     const photo = photos.find(p => p.id === id);
     if (!photo) return;
 
     setShowWatermarkCustomizer(null);
 
-    const updateProtectedPhoto = (watermarkedUrl: string, activityMessage: string, severity: ActivityRecord['severity'] = 'info') => {
-      setPhotos(prev => prev.map(p =>
-        p.id === id
-          ? {
-              ...p,
-              url: watermarkedUrl,
-              watermarked: true,
-              visibleWatermarkEnabled: wSettings.type === 'visible',
-              invisibleWatermarkEnabled: wSettings.type === 'invisible' || p.invisibleWatermarkEnabled,
-              watermarkText: wSettings.text,
-              watermarkPosition: wSettings.position,
-              watermarkOpacity: wSettings.opacity,
-              watermarkSize: wSettings.size,
-              protectionStatus: [
-                ...(p.protectionStatus ?? []),
-                wSettings.type === 'visible' ? 'Visible Watermark' : 'Invisible Watermark',
-              ],
-            }
-          : p
-      ));
-      setActiveView('vault');
-      addActivity('Watermark applied', activityMessage, severity);
-    };
-
     try {
-      // POST /watermark
-      const watermarkedImage = await watermarkImage(id, wSettings);
-      const watermarkedUrl =
-        watermarkedImage.watermarkedUrl ??
-        watermarkedImage.url ??
-        watermarkedImage.imageUrl ??
-        photo.url;
-      updateProtectedPhoto(watermarkedUrl, `${photo.name} protected by the backend watermark service.`);
-    } catch {
-      // Fallback: canvas watermark in the browser
-      const watermarkedUrl = await createLocalWatermarkedUrl(photo.url, wSettings);
-      updateProtectedPhoto(
-        watermarkedUrl,
-        `${photo.name} watermarked in the browser (backend watermark API unavailable).`,
-        'warning'
+      const updated = toPhoto(await watermarkImage(id, wSettings));
+      setPhotos(prev => prev.map(p => p.id === id ? updated : p));
+      setActiveView('vault');
+      addActivity(
+        'Watermark applied',
+        `${photo.name} — ${wSettings.type} watermark "${wSettings.text}". New SHA-256: ${updated.hashFingerprint?.slice(0, 16)}…`
       );
+    } catch (error) {
+      addActivity('Watermark failed', `${photo.name}: ${errorMessage(error)}`, 'critical');
     }
   }, [addActivity, photos]);
 
@@ -444,45 +337,38 @@ export default function App() {
     setPhotos(prev => prev.map(photo => photo.id === id ? { ...photo, ...updates } : photo));
   }, []);
 
-  // Download: GET /image/:id/download (falls back to local URL)
+  // Download: GET /image/:id/download
   const handleDownload = useCallback(async (id: string) => {
     const photo = photos.find(p => p.id === id);
     if (!photo) return;
 
-    let downloadUrl = photo.url;
-
     try {
-      // GET /image/:id/download
       const blob = await downloadImage(id);
-      downloadUrl = URL.createObjectURL(blob);
-    } catch {
-      addActivity('Local download fallback', `${photo.name} downloaded from browser memory (backend unavailable).`, 'warning');
+      const downloadUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = photo.watermarked ? `protected-${photo.name}` : photo.name;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+
+      setPhotos(prev => prev.map(p => p.id === id ? { ...p, viewCount: (p.viewCount || 0) + 1 } : p));
+      addActivity('File downloaded', `${photo.name} downloaded from the vault.`);
+    } catch (error) {
+      addActivity('Download failed', `${photo.name}: ${errorMessage(error)}`, 'critical');
     }
-
-    const link = document.createElement('a');
-    link.href = downloadUrl;
-    link.download = photo.watermarked ? `watermarked-${photo.name}` : photo.name;
-    link.click();
-
-    if (downloadUrl !== photo.url) URL.revokeObjectURL(downloadUrl);
-
-    setPhotos(prev => prev.map(p => p.id === id ? { ...p, viewCount: (p.viewCount || 0) + 1 } : p));
-    addActivity('File downloaded', `${photo.name} downloaded from the vault.`);
   }, [addActivity, photos]);
 
-  // Delete: DELETE /image/:id then remove from state
+  // Delete: DELETE /image/:id
   const handleDelete = useCallback(async (id: string) => {
     const photo = photos.find(p => p.id === id);
 
     try {
-      // DELETE /image/:id
       await deleteImage(id);
-      addActivity('File deleted', `${photo?.name ?? id} removed from the backend.`, 'warning');
-    } catch {
-      addActivity('Local delete', `${photo?.name ?? id} removed from local state (backend unavailable).`, 'warning');
+      setPhotos(prev => prev.filter(p => p.id !== id));
+      addActivity('File deleted', `${photo?.name ?? id} and its share links were removed.`, 'warning');
+    } catch (error) {
+      addActivity('Delete failed', `${photo?.name ?? id}: ${errorMessage(error)}`, 'critical');
     }
-
-    setPhotos(prev => prev.filter(p => p.id !== id));
   }, [addActivity, photos]);
 
   const handlePreview = useCallback((id: string) => {
@@ -500,38 +386,27 @@ export default function App() {
     if (!photo) return;
 
     try {
-      // POST /image/:id/share
       const link = await shareImage(id);
       updatePhoto(id, { shared: true, shareUrl: link });
-
-      if (link) {
-        await navigator.clipboard.writeText(link).catch(() => {});
-        addActivity('File shared', `${photo.name} — share link copied to clipboard: ${link}`);
-      } else {
-        updatePhoto(id, { shared: true });
-        addActivity('File shared', `${photo.name} is now publicly shared.`);
-      }
-    } catch {
-      // Fallback: mark shared locally
-      updatePhoto(id, { shared: true });
-      addActivity('Local share', `${photo.name} marked as shared in local state (backend unavailable).`, 'warning');
+      await navigator.clipboard?.writeText(link).catch(() => {});
+      addActivity('File shared', `${photo.name} — share link copied to clipboard: ${link}`, 'warning');
+    } catch (error) {
+      addActivity('Share failed', `${photo.name}: ${errorMessage(error)}`, 'critical');
     }
   }, [addActivity, photos, updatePhoto]);
 
-  // Revoke: POST /image/:id/revoke → clear share state
+  // Revoke: POST /image/:id/revoke → the link stops working immediately
   const handleRevokeAccess = useCallback(async (id: string) => {
     const photo = photos.find(p => p.id === id);
     if (!photo) return;
 
     try {
-      // POST /image/:id/revoke
-      await revokeImage(id);
-      addActivity('Access revoked', `${photo.name} share links revoked on the backend.`, 'warning');
-    } catch {
-      addActivity('Local revoke', `${photo.name} share links cleared locally (backend unavailable).`, 'warning');
+      const count = await revokeImage(id);
+      updatePhoto(id, { shared: false, shareUrl: undefined });
+      addActivity('Access revoked', `${photo.name} — ${count} share link(s) disabled.`);
+    } catch (error) {
+      addActivity('Revoke failed', `${photo.name}: ${errorMessage(error)}`, 'critical');
     }
-
-    updatePhoto(id, { shared: false, shareUrl: undefined });
   }, [addActivity, photos, updatePhoto]);
 
   const persistAccount = useCallback((nextAccount: StoredAccount) => {
@@ -539,16 +414,10 @@ export default function App() {
     setAccount(nextAccount);
   }, []);
 
-  const persistSession = useCallback((username: string, token?: string) => {
+  const persistSession = useCallback((username: string, token: string) => {
     window.localStorage.setItem(SESSION_STORAGE_KEY, username);
-    if (token) window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+    window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
     setCurrentUsername(username);
-  }, []);
-
-  const clearSession = useCallback(() => {
-    window.localStorage.removeItem(SESSION_STORAGE_KEY);
-    window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
-    setCurrentUsername(null);
   }, []);
 
   // Sign-up: POST /auth/signup
@@ -565,8 +434,8 @@ export default function App() {
       setAuthError('Please complete every sign-up field.');
       return;
     }
-    if (password.length < 6) {
-      setAuthError('Use a password with at least 6 characters.');
+    if (password.length < 8) {
+      setAuthError('Use a password with at least 8 characters.');
       return;
     }
     if (signUpForm.confirmPassword !== password) {
@@ -577,32 +446,20 @@ export default function App() {
     setAuthLoading(true);
 
     try {
-      // POST /auth/signup
       const signedUpUser = await signUpUser({ fullName, username, password });
-      const backendUsername = signedUpUser.user?.username ?? signedUpUser.username ?? username;
-      const backendFullName = signedUpUser.user?.fullName ?? signedUpUser.fullName ?? fullName;
+      const backendUsername = signedUpUser.user?.username ?? username;
+      const backendFullName = signedUpUser.user?.fullName ?? fullName;
 
-      persistAccount({ fullName: backendFullName, username: backendUsername, password: '' });
+      persistAccount({ fullName: backendFullName, username: backendUsername });
       clearSession();
       setSignInForm({ username: backendUsername, password: '' });
+      setSignUpForm({ fullName: '', username: '', password: '', confirmPassword: '' });
       setAuthNotice('Account created. Please sign in.');
       setAuthScreen('signin');
     } catch (error) {
-      if (error instanceof ApiError && error.status) {
-        setAuthError(error.message);
-        return;
-      }
-
-      // Demo fallback
-      const nextAccount = { fullName, username, password };
-      persistAccount(nextAccount);
-      clearSession();
-      setSignInForm({ username, password: '' });
-      setAuthNotice('Local demo account created. Connect your backend later to persist this.');
-      setAuthScreen('signin');
+      setAuthError(errorMessage(error));
     } finally {
       setAuthLoading(false);
-      setSignUpForm({ fullName: '', username: '', password: '', confirmPassword: '' });
     }
   }, [clearSession, persistAccount, signUpForm]);
 
@@ -623,48 +480,27 @@ export default function App() {
     setAuthLoading(true);
 
     try {
-      // POST /auth/login
       const loggedInUser = await loginUser({ username, password });
-      const backendUsername = loggedInUser.user?.username ?? loggedInUser.username ?? username;
-      const backendFullName = loggedInUser.user?.fullName ?? loggedInUser.fullName ?? account?.fullName ?? backendUsername;
-      const token = loggedInUser.token ?? loggedInUser.accessToken;
+      const backendUsername = loggedInUser.user?.username ?? username;
+      const backendFullName = loggedInUser.user?.fullName ?? backendUsername;
+      if (!loggedInUser.token) throw new ApiError('The server did not return a session token.');
 
-      persistAccount({ fullName: backendFullName, username: backendUsername, password: '' });
-      persistSession(backendUsername, token);
+      persistAccount({ fullName: backendFullName, username: backendUsername });
+      persistSession(backendUsername, loggedInUser.token);
       setSignInForm({ username: backendUsername, password: '' });
       setAuthScreen('dashboard');
+      setActiveView('upload');
 
-      // GET /images — restore vault files from backend
-      await loadVaultFromBackend(backendUsername);
+      await loadVaultFromBackend();
     } catch (error) {
-      if (error instanceof ApiError && error.status) {
-        setAuthError(error.message);
-        return;
-      }
-
-      // Demo fallback: authenticate against local browser account
-      if (!account) {
-        setAuthError('Create an account first.');
-        setAuthScreen('signup');
-        return;
-      }
-      if (username !== account.username || password !== account.password) {
-        setAuthError('That username or password is incorrect.');
-        return;
-      }
-
-      persistSession(account.username);
-      setSignInForm({ username: account.username, password: '' });
-      setAuthScreen('dashboard');
-
-      // Still attempt vault load even in fallback mode
-      await loadVaultFromBackend(account.username);
+      setAuthError(errorMessage(error));
     } finally {
       setAuthLoading(false);
     }
-  }, [account, loadVaultFromBackend, persistAccount, persistSession, signInForm]);
+  }, [loadVaultFromBackend, persistAccount, persistSession, signInForm]);
 
   const handleLogout = useCallback(() => {
+    logoutUser();
     clearSession();
     setPhotos([]);
     setActivityLog([]);
@@ -796,7 +632,7 @@ export default function App() {
                             value={signUpForm.password}
                             onChange={(e) => setSignUpForm(prev => ({ ...prev, password: e.target.value }))}
                             className="h-12 w-full rounded-xl border border-white/12 bg-white/8 px-4 text-white placeholder:text-slate-400"
-                            placeholder="Minimum 6 characters"
+                            placeholder="Minimum 8 characters"
                           />
                         </label>
                         <label className="block">
@@ -903,13 +739,15 @@ export default function App() {
                   {{
                     upload: 'Upload / Protect',
                     vault: 'My Files / Vault',
+                    verify: 'Verify Ownership',
                     settings: 'Settings',
                   }[activeView] ?? 'Upload / Protect'}
                 </h2>
                 <p className="text-muted-foreground">
                   {{
-                    upload: 'Upload a file — it gets an invisible ownership watermark and a SHA-256 fingerprint before it reaches the server.',
+                    upload: 'Uploads are stripped of location and camera metadata, stamped with an invisible ownership watermark, and fingerprinted with SHA-256.',
                     vault: 'Review every protected file with share, download, and revoke actions.',
+                    verify: 'Found a copy of a photo online? Check whether it carries a PhotoGuard ownership mark.',
                     settings: 'Set the workspace theme for your demo.',
                   }[activeView] ?? ''}
                 </p>
@@ -1055,6 +893,8 @@ export default function App() {
             </div>
           )}
 
+          {activeView === 'verify' && <VerifyPanel />}
+
           {activeView === 'settings' && (
             <div className="space-y-6">
               <div className="rounded-lg border border-border bg-card p-6">
@@ -1077,11 +917,12 @@ export default function App() {
               <div className="rounded-lg border border-border bg-card p-6">
                 <h3 className="text-foreground mb-2">Backend</h3>
                 <p className="text-sm text-muted-foreground mb-3">
-                  All API calls proxy through Vite to <code className="font-mono text-xs">localhost:3000</code> in development.
+                  In development, Vite forwards API calls to <code className="font-mono text-xs">localhost:3000</code>.
                   Set <code className="font-mono text-xs">VITE_API_BASE_URL</code> to target a deployed backend.
                 </p>
                 <p className="text-sm text-muted-foreground">
-                  Endpoints in use: <code className="font-mono text-xs">POST /auth/signup</code> · <code className="font-mono text-xs">POST /auth/login</code> · <code className="font-mono text-xs">GET /images</code> · <code className="font-mono text-xs">POST /upload</code> · <code className="font-mono text-xs">POST /watermark</code> · <code className="font-mono text-xs">GET /image/:id/download</code> · <code className="font-mono text-xs">DELETE /image/:id</code> · <code className="font-mono text-xs">POST /image/:id/share</code> · <code className="font-mono text-xs">POST /image/:id/revoke</code> · <code className="font-mono text-xs">GET /image/:id/proof</code>
+                  Every vault request carries your session token. Files are served through signed links, and share links stop working the moment you revoke them.
+                  Interactive API docs: <a className="underline" href="http://localhost:3000/docs" target="_blank" rel="noreferrer">localhost:3000/docs</a>
                 </p>
               </div>
             </div>
